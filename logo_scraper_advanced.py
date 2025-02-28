@@ -4,6 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import uuid
+import base64
+import json
 from urllib.parse import urljoin, urlparse
 from PIL import Image
 from io import BytesIO
@@ -11,50 +13,82 @@ import time
 
 # Google Drive API imports
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import pickle
 
 # Constants for Google API
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
-TOKEN_PATH = 'token.pickle'
-CREDENTIALS_PATH = 'credentials.json'
 
 class GoogleDriveUploader:
     def __init__(self):
+        # Get credentials from Streamlit secrets or environment
         self.drive_service = self._authenticate()
-        self.folder_id = self._get_or_create_folder("Website_Logos")
+        if self.drive_service:
+            self.folder_id = self._get_or_create_folder("Website_Logos")
+        else:
+            self.folder_id = None
         
     def _authenticate(self):
-        """Authenticate with Google Drive API"""
-        creds = None
-        
-        # Load credentials from saved token
-        if os.path.exists(TOKEN_PATH):
-            with open(TOKEN_PATH, 'rb') as token:
-                creds = pickle.load(token)
+        """Authenticate with Google Drive API using stored credentials"""
+        try:
+            # Try to get credentials from Streamlit secrets
+            if 'google_credentials' in st.secrets:
+                creds_info = st.secrets['google_credentials']
+                creds = Credentials(
+                    token=creds_info.get('token'),
+                    refresh_token=creds_info.get('refresh_token'),
+                    token_uri=creds_info.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                    client_id=creds_info.get('client_id'),
+                    client_secret=creds_info.get('client_secret'),
+                    scopes=SCOPES
+                )
                 
-        # Check if credentials are valid or need refresh
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                # If no valid credentials, need to authenticate
-                if not os.path.exists(CREDENTIALS_PATH):
-                    st.error("Missing credentials.json file. Please download it from Google Cloud Console.")
-                    st.info("Instructions: \n1. Go to Google Cloud Console\n2. Create a project\n3. Enable Drive API\n4. Create OAuth credentials\n5. Download as credentials.json")
-                    return None
+                # Refresh if expired
+                if creds.expired:
+                    creds.refresh(Request())
                     
-                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-                creds = flow.run_local_server(port=0)
+                return build('drive', 'v3', credentials=creds)
+            else:
+                # Fallback to check if credentials are passed as file
+                st.warning("Google Drive credentials not found in Streamlit secrets.")
                 
-            # Save the credentials
-            with open(TOKEN_PATH, 'wb') as token:
-                pickle.dump(creds, token)
+                # Check if credentials.json exists for local development
+                if os.path.exists('credentials.json'):
+                    st.info("Using credentials.json file for authentication.")
+                    creds_upload = st.file_uploader("Upload service account JSON key file", type=['json'])
+                    
+                    if creds_upload:
+                        creds_dict = json.load(creds_upload)
+                        creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+                        
+                        # Refresh if expired
+                        if creds.expired and creds.refresh_token:
+                            creds.refresh(Request())
+                            
+                        return build('drive', 'v3', credentials=creds)
                 
-        return build('drive', 'v3', credentials=creds)
+                st.error("""
+                To use Google Drive integration in cloud deployment:
+                
+                1. Go to Streamlit dashboard → App settings → Secrets
+                2. Add your Google API credentials in the following format:
+                
+                ```
+                [google_credentials]
+                token = "your_token"
+                refresh_token = "your_refresh_token"
+                token_uri = "https://oauth2.googleapis.com/token"
+                client_id = "your_client_id"
+                client_secret = "your_client_secret"
+                ```
+                """)
+                
+                return None
+                
+        except Exception as e:
+            st.error(f"Error authenticating with Google Drive: {str(e)}")
+            return None
     
     def _get_or_create_folder(self, folder_name):
         """Get ID of existing folder or create a new one"""
@@ -224,36 +258,17 @@ def main():
     st.title("Website Logo Scraper with Google Drive Integration")
     st.write("Upload an Excel file with website URLs to extract logos and upload them to Google Drive")
     
-    # Check for credentials
-    if not os.path.exists(CREDENTIALS_PATH):
-        st.warning("Google Drive API credentials not found.")
-        st.info("""
-        To use Google Drive integration, you need to:
-        1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-        2. Create a new project
-        3. Enable the Google Drive API
-        4. Create OAuth 2.0 Client ID credentials
-        5. Download the credentials as JSON
-        6. Rename the file to `credentials.json` and place it in the same directory as this script
-        """)
-        
-        # Option to continue without Google Drive
-        use_drive = st.checkbox("I'll add Google Drive integration later, continue without it", value=True)
-        if not use_drive:
-            return
-    else:
-        use_drive = True
+    # Detect if running in Streamlit Cloud
+    is_cloud = os.environ.get('STREAMLIT_SHARING', '') or os.environ.get('STREAMLIT_CLOUD', '')
     
-    # Initialize Google Drive uploader if enabled
+    # Initialize Google Drive uploader
     drive_uploader = None
-    if use_drive and os.path.exists(CREDENTIALS_PATH):
-        with st.spinner("Authenticating with Google Drive..."):
-            drive_uploader = GoogleDriveUploader()
-            if drive_uploader.drive_service:
-                st.success("Connected to Google Drive!")
-            else:
-                st.error("Failed to connect to Google Drive.")
-                return
+    with st.spinner("Checking Google Drive authentication..."):
+        drive_uploader = GoogleDriveUploader()
+        if drive_uploader.drive_service:
+            st.success("Connected to Google Drive!")
+        else:
+            st.warning("Not connected to Google Drive. Logos will be extracted but not uploaded.")
     
     uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls"])
     
@@ -277,7 +292,7 @@ def main():
                 
                 # Create new columns for results
                 df['logo_path'] = None
-                if drive_uploader:
+                if drive_uploader and drive_uploader.drive_service:
                     df['drive_view_link'] = None
                     df['drive_download_link'] = None
                 
@@ -293,7 +308,7 @@ def main():
                     df.at[i, 'logo_path'] = logo_path
                     
                     # Upload to Google Drive if enabled and logo was found
-                    if drive_uploader and logo_path:
+                    if drive_uploader and drive_uploader.drive_service and logo_path:
                         with st.spinner(f"Uploading logo for {url} to Google Drive..."):
                             upload_result = drive_uploader.upload_image(logo_path)
                             if upload_result:
@@ -312,9 +327,10 @@ def main():
                 
                 # Provide download button for the resulting Excel file
                 with open(output_filename, "rb") as file:
+                    file_data = file.read()
                     st.download_button(
                         label="Download Results",
-                        data=file,
+                        data=file_data,
                         file_name=output_filename,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
@@ -331,7 +347,7 @@ def main():
                         st.write(f"**{row[url_column]}**")
                         st.image(row['logo_path'], width=150)
                     with col2:
-                        if drive_uploader and pd.notna(row.get('drive_download_link')):
+                        if drive_uploader and drive_uploader.drive_service and pd.notna(row.get('drive_download_link')):
                             st.write("**Google Drive Links:**")
                             st.write(f"View: [{row['drive_view_link']}]({row['drive_view_link']})")
                             st.write(f"**Direct link for Webflow:** [{row['drive_download_link']}]({row['drive_download_link']})")
@@ -339,6 +355,7 @@ def main():
         
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
+            st.exception(e)
 
 if __name__ == "__main__":
     main()
