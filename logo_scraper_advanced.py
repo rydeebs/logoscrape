@@ -152,6 +152,14 @@ def main():
     st.title("Website Logo Scraper with Mapping File")
     st.write("Upload an Excel file with website URLs to extract logos and create a mapping file for Google Drive")
     
+    # Use session state to store file data for downloads
+    if 'has_run' not in st.session_state:
+        st.session_state.has_run = False
+        st.session_state.zip_data = None
+        st.session_state.mapping_data = None
+        st.session_state.excel_data = None
+        st.session_state.all_logos = []
+    
     uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls", "csv"])
     
     if uploaded_file:
@@ -170,91 +178,115 @@ def main():
             # Let the user select the column containing URLs
             url_column = st.selectbox("Select the column containing website URLs", df.columns)
             
-            if st.button("Extract Logos"):
-                # Add a progress bar
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            if st.button("Extract Logos") or st.session_state.has_run:
+                # Skip processing if already run
+                if not st.session_state.has_run:
+                    # Add a progress bar
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # Store the image data and mapping info
+                    all_logos = []
+                    mapping_data = []
+                    
+                    # Create new columns for results
+                    df['logo_found'] = False
+                    df['logo_filename'] = None
+                    
+                    # Process each URL
+                    for i, row in df.iterrows():
+                        url = str(row[url_column])
+                        status_text.text(f"Processing {i+1}/{len(df)}: {url}")
+                        
+                        # Get the logo
+                        logo_info = get_site_logo(url)
+                        
+                        # Update the DataFrame and mapping data
+                        if logo_info:
+                            df.at[i, 'logo_found'] = True
+                            df.at[i, 'logo_filename'] = logo_info['filename']
+                            all_logos.append(logo_info)
+                            mapping_data.append({
+                                'url': url,
+                                'domain': logo_info['domain'],
+                                'filename': logo_info['filename']
+                            })
+                        
+                        # Update progress
+                        progress_bar.progress((i + 1) / len(df))
+                        
+                        # Small delay to prevent overwhelming websites
+                        time.sleep(0.5)
+                    
+                    # Create a zip file with all logos
+                    if all_logos:
+                        zip_filename = "all_logos.zip"
+                        with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                            for logo in all_logos:
+                                zipf.write(logo['path'], logo['filename'])
+                        
+                        # Store zip data in session state
+                        with open(zip_filename, "rb") as f:
+                            st.session_state.zip_data = f.read()
+                    
+                    # Create mapping file
+                    if mapping_data:
+                        mapping_filename = create_mapping_file(mapping_data)
+                        
+                        # Store mapping data in session state
+                        with open(mapping_filename, "rb") as f:
+                            st.session_state.mapping_data = f.read()
+                    
+                    # Save the results to Excel
+                    output_filename = "logos_extraction_results.xlsx"
+                    df.to_excel(output_filename, index=False)
+                    
+                    # Store Excel data in session state
+                    with open(output_filename, "rb") as file:
+                        st.session_state.excel_data = file.read()
+                    
+                    # Store logos in session state
+                    st.session_state.all_logos = all_logos
+                    
+                    # Set the flag to indicate processing is done
+                    st.session_state.has_run = True
                 
-                # Store the image data and mapping info
-                all_logos = []
-                mapping_data = []
+                # Display the results (whether just processed or retrieved from session state)
+                success_count = sum(1 for logo in st.session_state.all_logos)
+                st.success(f"Processed {len(df)} websites. Successfully extracted {success_count} logos.")
                 
-                # Create new columns for results
-                df['logo_found'] = False
-                df['logo_filename'] = None
+                # Display download buttons (these will persist because they use session state data)
+                col1, col2, col3 = st.columns(3)
                 
-                # Process each URL
-                for i, row in df.iterrows():
-                    url = str(row[url_column])
-                    status_text.text(f"Processing {i+1}/{len(df)}: {url}")
-                    
-                    # Get the logo
-                    logo_info = get_site_logo(url)
-                    
-                    # Update the DataFrame and mapping data
-                    if logo_info:
-                        df.at[i, 'logo_found'] = True
-                        df.at[i, 'logo_filename'] = logo_info['filename']
-                        all_logos.append(logo_info)
-                        mapping_data.append({
-                            'url': url,
-                            'domain': logo_info['domain'],
-                            'filename': logo_info['filename']
-                        })
-                    
-                    # Update progress
-                    progress_bar.progress((i + 1) / len(df))
-                    
-                    # Small delay to prevent overwhelming websites
-                    time.sleep(0.5)
-                
-                # Create a zip file with all logos
-                if all_logos:
-                    zip_filename = "all_logos.zip"
-                    with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                        for logo in all_logos:
-                            zipf.write(logo['path'], logo['filename'])
-                    
-                    # Provide download button for the zip file
-                    with open(zip_filename, "rb") as f:
-                        zip_data = f.read()
+                with col1:
+                    if st.session_state.zip_data:
                         st.download_button(
                             label="Download All Logos (ZIP)",
-                            data=zip_data,
-                            file_name=zip_filename,
-                            mime="application/zip"
+                            data=st.session_state.zip_data,
+                            file_name="all_logos.zip",
+                            mime="application/zip",
+                            key="zip_download"
                         )
                 
-                # Create mapping file
-                if mapping_data:
-                    mapping_filename = create_mapping_file(mapping_data)
-                    
-                    # Provide download button for the mapping file
-                    with open(mapping_filename, "rb") as f:
-                        mapping_data = f.read()
+                with col2:
+                    if st.session_state.mapping_data:
                         st.download_button(
-                            label="Download Logo Mapping File (CSV)",
-                            data=mapping_data,
-                            file_name=mapping_filename,
-                            mime="text/csv"
+                            label="Download Mapping File (CSV)",
+                            data=st.session_state.mapping_data,
+                            file_name="logo_mapping.csv",
+                            mime="text/csv",
+                            key="mapping_download"
                         )
                 
-                # Save the results
-                output_filename = "logos_extraction_results.xlsx"
-                df.to_excel(output_filename, index=False)
-                
-                # Provide download button for the Excel file
-                with open(output_filename, "rb") as file:
-                    st.download_button(
-                        label="Download Results (Excel)",
-                        data=file,
-                        file_name=output_filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                
-                # Display the results
-                success_count = df['logo_found'].sum()
-                st.success(f"Processed {len(df)} websites. Successfully extracted {success_count} logos.")
+                with col3:
+                    if st.session_state.excel_data:
+                        st.download_button(
+                            label="Download Results (Excel)",
+                            data=st.session_state.excel_data,
+                            file_name="logos_extraction_results.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="excel_download"
+                        )
                 
                 # Show how to use the mapping file
                 st.subheader("Next Steps for Google Drive Integration")
@@ -269,15 +301,24 @@ def main():
                 """)
                 
                 # Show thumbnails of the extracted logos
-                if all_logos:
+                if st.session_state.all_logos:
                     st.subheader("Extracted Logos")
                     
                     # Create a grid layout
                     cols = st.columns(3)
-                    for i, logo in enumerate(all_logos):
+                    for i, logo in enumerate(st.session_state.all_logos):
                         col = cols[i % 3]
                         with col:
-                            st.image(logo['path'], caption=f"{logo['domain']} - {logo['filename']}", width=150)
+                            st.image(logo['path'], caption=f"{logo['domain']}", width=150)
+                
+                # Button to reset and run again
+                if st.button("Reset and Run Again"):
+                    st.session_state.has_run = False
+                    st.session_state.zip_data = None
+                    st.session_state.mapping_data = None
+                    st.session_state.excel_data = None
+                    st.session_state.all_logos = []
+                    st.experimental_rerun()
         
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
