@@ -5,13 +5,11 @@ from bs4 import BeautifulSoup
 import os
 import uuid
 import zipfile
-import base64
 from urllib.parse import urljoin, urlparse
 from PIL import Image
 from io import BytesIO
 import time
-import openpyxl
-from openpyxl.drawing.image import Image as XLImage
+import csv
 
 def get_site_logo(url):
     """
@@ -87,40 +85,38 @@ def get_site_logo(url):
                 # Check if it's a valid image
                 img = Image.open(BytesIO(img_response.content))
                 
-                # Convert to RGB if needed (for PNG with transparency)
-                if img.mode == 'RGBA':
+                # Determine best format - keep original format if possible
+                save_format = img.format if img.format in ('JPEG', 'PNG') else 'PNG'
+                ext = 'jpg' if save_format == 'JPEG' else 'png'
+                
+                # Convert to RGB if needed (for RGBA images)
+                if img.mode == 'RGBA' and save_format == 'JPEG':
                     # Create a white background
                     background = Image.new('RGB', img.size, (255, 255, 255))
                     # Paste using alpha channel as mask
                     background.paste(img, mask=img.split()[3])
                     img = background
-                elif img.mode != 'RGB':
+                elif img.mode != 'RGB' and save_format == 'JPEG':
                     img = img.convert('RGB')
                 
                 # Generate a unique filename
                 domain = urlparse(url).netloc
-                # Always save as JPG for consistency
-                filename = f"{domain.replace('.', '_')}_{uuid.uuid4().hex[:8]}.jpg"
+                filename = f"{domain.replace('.', '_')}_{uuid.uuid4().hex[:8]}.{ext}"
                 
                 # Create images directory if it doesn't exist
                 os.makedirs('logos', exist_ok=True)
                 
-                # Save the image as JPG
+                # Save the image
                 img_path = os.path.join('logos', filename)
-                img.save(img_path, 'JPEG', quality=85)
-                
-                # Save the image data to memory as well
-                img_byte_arr = BytesIO()
-                img.save(img_byte_arr, format='JPEG', quality=85)
-                img_data = img_byte_arr.getvalue()
+                img.save(img_path, save_format)
                 
                 # Return all the image information
                 return {
                     'path': img_path,
                     'filename': filename,
-                    'data': img_data,
-                    'format': 'jpg',
-                    'pil_image': img
+                    'format': ext,
+                    'domain': domain,
+                    'url': url
                 }
             
             except Exception as e:
@@ -132,65 +128,39 @@ def get_site_logo(url):
         st.error(f"Error processing {url}: {str(e)}")
         return None
 
-def create_excel_with_embedded_images(df, logo_info_dict, url_column):
+def create_mapping_file(mapping_data):
     """
-    Create an Excel file with the logos embedded in cells.
+    Create a CSV file mapping website URLs to logo filenames.
     """
-    # Create a new Excel workbook and select the active sheet
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Logo Extraction Results"
-    
-    # Add headers
-    headers = list(df.columns) + ["Logo Image"]
-    for col_num, header in enumerate(headers, 1):
-        ws.cell(row=1, column=col_num).value = header
-    
-    # Add data and images
-    for row_num, (_, row) in enumerate(df.iterrows(), 2):
-        # Add regular cell data
-        for col_num, col_name in enumerate(df.columns, 1):
-            ws.cell(row=row_num, column=col_num).value = row[col_name]
+    filename = "logo_mapping.csv"
+    with open(filename, 'w', newline='') as csvfile:
+        fieldnames = ['website_url', 'domain', 'logo_filename', 'google_drive_url']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
-        # Add image if available
-        url = row[url_column]
-        if url in logo_info_dict and logo_info_dict[url]:
-            logo_path = logo_info_dict[url]['path']
-            try:
-                # Place image in the last column
-                img = XLImage(logo_path)
-                # Resize the image to fit in a cell
-                img.width = 150
-                img.height = 75
-                ws.add_image(img, f"{chr(65 + len(df.columns))}{row_num}")
-                
-                # Adjust row height to accommodate the image
-                ws.row_dimensions[row_num].height = 60
-            except Exception as e:
-                ws.cell(row=row_num, column=len(df.columns) + 1).value = "Error embedding image"
+        writer.writeheader()
+        for data in mapping_data:
+            writer.writerow({
+                'website_url': data['url'],
+                'domain': data['domain'],
+                'logo_filename': data['filename'],
+                'google_drive_url': ''  # Empty column to be filled after Google Drive upload
+            })
     
-    # Adjust column widths
-    for col in range(1, len(headers) + 1):
-        if col == len(headers):  # Logo column
-            ws.column_dimensions[chr(64 + col)].width = 25
-        else:
-            ws.column_dimensions[chr(64 + col)].width = 15
-    
-    # Save the workbook
-    output_filename = "logos_extracted.xlsx"
-    wb.save(output_filename)
-    return output_filename
+    return filename
 
 def main():
-    st.title("Website Logo Scraper")
-    st.write("Upload an Excel file with website URLs to extract logos")
+    st.title("Website Logo Scraper with Mapping File")
+    st.write("Upload an Excel file with website URLs to extract logos and create a mapping file for Google Drive")
     
-    uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls"])
+    uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls", "csv"])
     
     if uploaded_file:
         try:
-            # Read the Excel file
-            df = pd.read_excel(uploaded_file)
+            # Read the uploaded file
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
             
             # Check if the DataFrame has any columns
             if df.empty or len(df.columns) == 0:
@@ -205,9 +175,9 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Store the image data
+                # Store the image data and mapping info
                 all_logos = []
-                logo_info_dict = {}
+                mapping_data = []
                 
                 # Create new columns for results
                 df['logo_found'] = False
@@ -221,12 +191,16 @@ def main():
                     # Get the logo
                     logo_info = get_site_logo(url)
                     
-                    # Update the DataFrame
+                    # Update the DataFrame and mapping data
                     if logo_info:
                         df.at[i, 'logo_found'] = True
                         df.at[i, 'logo_filename'] = logo_info['filename']
                         all_logos.append(logo_info)
-                        logo_info_dict[url] = logo_info
+                        mapping_data.append({
+                            'url': url,
+                            'domain': logo_info['domain'],
+                            'filename': logo_info['filename']
+                        })
                     
                     # Update progress
                     progress_bar.progress((i + 1) / len(df))
@@ -251,36 +225,48 @@ def main():
                             mime="application/zip"
                         )
                 
-                # Create an Excel file with embedded images
-                with st.spinner("Creating Excel file with embedded images..."):
-                    excel_file = create_excel_with_embedded_images(df, logo_info_dict, url_column)
-                
-                # Save a simple results Excel without embedded images (as backup)
-                simple_excel = "logos_extracted_simple.xlsx"
-                df.to_excel(simple_excel, index=False)
-                
-                # Provide download buttons for the Excel files
-                with open(excel_file, "rb") as file:
-                    st.download_button(
-                        label="Download Excel with Embedded Images",
-                        data=file,
-                        file_name=excel_file,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="excel_with_images"
-                    )
+                # Create mapping file
+                if mapping_data:
+                    mapping_filename = create_mapping_file(mapping_data)
                     
-                with open(simple_excel, "rb") as file:
+                    # Provide download button for the mapping file
+                    with open(mapping_filename, "rb") as f:
+                        mapping_data = f.read()
+                        st.download_button(
+                            label="Download Logo Mapping File (CSV)",
+                            data=mapping_data,
+                            file_name=mapping_filename,
+                            mime="text/csv"
+                        )
+                
+                # Save the results
+                output_filename = "logos_extraction_results.xlsx"
+                df.to_excel(output_filename, index=False)
+                
+                # Provide download button for the Excel file
+                with open(output_filename, "rb") as file:
                     st.download_button(
-                        label="Download Simple Excel Results",
+                        label="Download Results (Excel)",
                         data=file,
-                        file_name=simple_excel,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="excel_simple"
+                        file_name=output_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 
                 # Display the results
                 success_count = df['logo_found'].sum()
                 st.success(f"Processed {len(df)} websites. Successfully extracted {success_count} logos.")
+                
+                # Show how to use the mapping file
+                st.subheader("Next Steps for Google Drive Integration")
+                st.markdown("""
+                1. **Extract the logo files** from the ZIP download
+                2. **Upload the logos to Google Drive** in a shared folder
+                3. **For each logo in Google Drive**:
+                   - Get the sharing link (right-click > "Get link")
+                   - Convert to direct link format: `https://drive.google.com/uc?export=view&id=FILE_ID`
+                   - Update the `google_drive_url` column in the mapping CSV
+                4. **Use the updated mapping file** for your Webflow CMS import
+                """)
                 
                 # Show thumbnails of the extracted logos
                 if all_logos:
@@ -291,19 +277,7 @@ def main():
                     for i, logo in enumerate(all_logos):
                         col = cols[i % 3]
                         with col:
-                            domain = logo['filename'].split('_')[0]
-                            st.image(logo['path'], caption=domain, width=150)
-                            
-                            # Individual download button for each logo
-                            with open(logo['path'], "rb") as img_file:
-                                img_data = img_file.read()
-                                st.download_button(
-                                    label="Download",
-                                    data=img_data,
-                                    file_name=logo['filename'],
-                                    mime=f"image/{logo['format']}",
-                                    key=f"logo_{i}"
-                                )
+                            st.image(logo['path'], caption=f"{logo['domain']} - {logo['filename']}", width=150)
         
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
