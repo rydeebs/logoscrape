@@ -1,150 +1,182 @@
 import streamlit as st
 import pandas as pd
-import csv
-from io import StringIO
+import json
+import os
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from io import BytesIO
+
+def authenticate_with_service_account(json_content):
+    """Authenticate using a service account JSON key"""
+    try:
+        # Parse the JSON content
+        if isinstance(json_content, str):
+            credentials_info = json.loads(json_content)
+        else:
+            credentials_info = json_content
+        
+        # Create credentials
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_info, 
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        
+        # Build the service
+        drive_service = build('drive', 'v3', credentials=credentials)
+        return drive_service, None
+    except Exception as e:
+        return None, str(e)
+
+def get_folder_files(drive_service, folder_id):
+    """Get all files in a specific Google Drive folder"""
+    try:
+        # List all files in the folder
+        results = drive_service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType, webContentLink)",
+            pageSize=1000
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        # If there are more files, get them with pagination
+        page_token = results.get('nextPageToken')
+        while page_token:
+            results = drive_service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="files(id, name, mimeType, webContentLink)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            
+            files.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+        
+        # Filter for image files only
+        image_files = [f for f in files if f['mimeType'].startswith('image/')]
+        
+        # Add direct URL to each file
+        for file in image_files:
+            file['direct_url'] = f"https://drive.google.com/uc?export=view&id={file['id']}"
+        
+        return image_files, None
+    except Exception as e:
+        return None, str(e)
+
+def update_mapping_csv(file_data, mapping_df):
+    """Update mapping DataFrame with Google Drive URLs"""
+    try:
+        # Create a dictionary to quickly look up file IDs by filename
+        file_dict = {item['name']: item['direct_url'] for item in file_data}
+        
+        # Update the google_drive_url column based on matching filenames
+        mapping_df['google_drive_url'] = mapping_df['logo_filename'].map(lambda x: file_dict.get(x, ''))
+        
+        return mapping_df, True
+    except Exception as e:
+        return None, str(e)
 
 def main():
-    st.title("Simple Google Drive URL Generator")
-    st.write("Generate Google Drive direct URLs for your logos without needing API access")
+    st.title("Google Drive Bulk URL Generator")
+    st.write("Generate direct URLs for thousands of images in your Google Drive folder")
     
-    # Step 1: Get the folder ID
-    st.header("Step 1: Get Your Google Drive Folder ID")
+    st.header("Step 1: Set Up Google Drive Access")
     
     st.markdown("""
-    1. Open your Google Drive folder containing logo images
-    2. Look at the URL in your browser
-    3. The folder ID is the string after `folders/` in the URL
+    ### Using a Service Account for Authentication
+    
+    For bulk processing thousands of images, you'll need to use a Google Service Account:
+    
+    1. Go to [Google Cloud Console](https://console.cloud.google.com)
+    2. Create a project (or select existing one)
+    3. Enable the Google Drive API
+    4. Go to "IAM & Admin" > "Service Accounts"
+    5. Create a Service Account
+    6. Create a JSON key for the service account
+    7. Download the JSON key
+    8. Share your Google Drive folder with the service account email (it looks like `name@project-id.iam.gserviceaccount.com`)
+    
+    Then upload the JSON key file below:
+    """)
+    
+    # Service account key upload
+    service_account_key = st.file_uploader("Upload Service Account JSON key", type=["json"])
+    
+    if service_account_key:
+        # Read the key content
+        key_content = json.load(service_account_key)
+        
+        # Store in session state
+        st.session_state.key_content = key_content
+        
+        # Show service account email for sharing
+        if 'client_email' in key_content:
+            st.info(f"Share your Google Drive folder with this email: **{key_content['client_email']}**")
+    
+    # Step 2: Get folder ID
+    st.header("Step 2: Get Your Google Drive Folder ID")
+    
+    st.markdown("""
+    1. Open your Google Drive folder containing the logo images
+    2. The folder ID is the string after `folders/` in the URL
     
     For example, in `https://drive.google.com/drive/folders/1AbCdEfGhIj-KlMnOpQr`, the folder ID is `1AbCdEfGhIj-KlMnOpQr`
     """)
     
     folder_id = st.text_input("Enter your Google Drive folder ID")
     
-    # Step 2: Manual file ID input
-    st.header("Step 2: List Your Files and IDs")
-    
-    st.markdown("""
-    ### Instructions:
-    
-    For each logo file in your Google Drive folder:
-    
-    1. Right-click on the file
-    2. Select "Get link" (or "Share")
-    3. Copy the ID from the sharing link (the part between `/d/` and `/view`)
-    
-    For example, from `https://drive.google.com/file/d/1AbCdEfGhIj-KlMnOpQr/view?usp=sharing`,
-    the ID is `1AbCdEfGhIj-KlMnOpQr`
-    
-    You can add multiple files below by clicking "Add another file"
-    """)
-    
-    # Initialize session state for files
-    if 'files' not in st.session_state:
-        st.session_state.files = [{"filename": "", "file_id": ""}]
-    
-    # Display fields for each file
-    for i, file in enumerate(st.session_state.files):
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            st.session_state.files[i]["filename"] = st.text_input(
-                "Filename (e.g., fruit4u_co_c30ad305.png)",
-                file["filename"],
-                key=f"filename_{i}"
-            )
-        with col2:
-            st.session_state.files[i]["file_id"] = st.text_input(
-                "File ID from sharing link",
-                file["file_id"],
-                key=f"file_id_{i}"
-            )
-        
-        # Add delete button for each entry except the first one
-        if i > 0:
-            if st.button("Remove this file", key=f"remove_{i}"):
-                st.session_state.files.pop(i)
-                st.experimental_rerun()
-        
-        st.markdown("---")
-    
-    # Add button to add another file
-    if st.button("Add another file"):
-        st.session_state.files.append({"filename": "", "file_id": ""})
-        st.experimental_rerun()
-    
-    # Alternative: Bulk entry
-    st.header("OR: Bulk Entry")
-    
-    st.markdown("""
-    If you have many files, you can enter them in bulk using this format (one per line):
-    ```
-    filename.png,fileID
-    ```
-    """)
-    
-    bulk_text = st.text_area("Enter filename,fileID pairs (one per line)")
-    
-    if st.button("Process Bulk Entry"):
-        if bulk_text:
-            # Parse the bulk text
-            lines = bulk_text.strip().split('\n')
-            new_files = []
+    # Process the folder
+    if folder_id and st.button("Process Folder") and 'key_content' in st.session_state:
+        with st.spinner("Connecting to Google Drive..."):
+            # Authenticate
+            drive_service, error = authenticate_with_service_account(st.session_state.key_content)
             
-            for line in lines:
-                if ',' in line:
-                    filename, file_id = line.split(',', 1)
-                    new_files.append({"filename": filename.strip(), "file_id": file_id.strip()})
-            
-            if new_files:
-                st.session_state.files = new_files
-                st.success(f"Added {len(new_files)} files from bulk entry")
-                st.experimental_rerun()
+            if error:
+                st.error(f"Authentication failed: {error}")
+            elif drive_service:
+                # Get files from the folder
+                with st.spinner(f"Fetching files from folder..."):
+                    files, error = get_folder_files(drive_service, folder_id)
+                    
+                    if error:
+                        st.error(f"Error fetching files: {error}")
+                    elif files:
+                        # Store in session state
+                        st.session_state.files = files
+                        
+                        # Display summary
+                        st.success(f"Found {len(files)} image files in the folder")
+                        
+                        # Show preview
+                        preview_df = pd.DataFrame([
+                            {'filename': f['name'], 'direct_url': f['direct_url']}
+                            for f in files[:5]  # Just show first 5 for preview
+                        ])
+                        st.write("Preview of first 5 files:")
+                        st.dataframe(preview_df)
+                    else:
+                        st.warning("No image files found in the specified folder")
     
-    # Step 3: Generate URLs
-    st.header("Step 3: Generate Direct URLs")
-    
-    if st.button("Generate Direct URLs"):
-        # Filter out entries with empty fields
-        valid_files = [f for f in st.session_state.files if f["filename"] and f["file_id"]]
-        
-        if valid_files:
-            # Generate direct URLs
-            for file in valid_files:
-                file["direct_url"] = f"https://drive.google.com/uc?export=view&id={file['file_id']}"
-            
-            # Store the result
-            st.session_state.valid_files = valid_files
-            
-            # Show success message
-            st.success(f"Generated direct URLs for {len(valid_files)} files")
-        else:
-            st.error("No valid files found. Please enter at least one filename and file ID.")
-    
-    # Step 4: Download results
-    if 'valid_files' in st.session_state and st.session_state.valid_files:
-        st.header("Step 4: Download Results")
-        
-        # Display the results
-        st.subheader("Generated Direct URLs")
-        result_df = pd.DataFrame(st.session_state.valid_files)
-        st.dataframe(result_df)
+    # Step 3: Generate mapping
+    if 'files' in st.session_state and st.session_state.files:
+        st.header("Step 3: Create or Update Mapping")
         
         # Option 1: Simple mapping
-        st.subheader("Option 1: Simple Filename to URL Mapping")
-        
-        csv_data = StringIO()
-        csv_writer = csv.writer(csv_data)
-        csv_writer.writerow(["filename", "direct_url"])
-        
-        for file in st.session_state.valid_files:
-            csv_writer.writerow([file["filename"], file["direct_url"]])
-        
-        st.download_button(
-            label="Download Simple Mapping CSV",
-            data=csv_data.getvalue(),
-            file_name="filename_to_url.csv",
-            mime="text/csv",
-            key="simple_mapping"
-        )
+        if st.button("Generate Simple Mapping CSV"):
+            file_data = [{'filename': f['name'], 'direct_url': f['direct_url']} for f in st.session_state.files]
+            df = pd.DataFrame(file_data)
+            
+            # Convert to CSV
+            csv = df.to_csv(index=False)
+            
+            # Offer download
+            st.download_button(
+                label="Download Simple Mapping CSV",
+                data=csv,
+                file_name="filename_to_url.csv",
+                mime="text/csv",
+                key="simple_mapping"
+            )
         
         # Option 2: Update existing mapping
         st.subheader("Option 2: Update Your Existing Mapping CSV")
@@ -156,30 +188,63 @@ def main():
                 # Read the mapping file
                 mapping_df = pd.read_csv(mapping_file)
                 
-                # Create a dictionary for faster lookup
-                url_dict = {file["filename"]: file["direct_url"] for file in st.session_state.valid_files}
-                
-                # Update the google_drive_url column
-                mapping_df["google_drive_url"] = mapping_df["logo_filename"].map(lambda x: url_dict.get(x, ""))
-                
-                # Preview
-                st.write("Preview of updated mapping:")
-                st.dataframe(mapping_df.head())
-                
-                # Create CSV for download
-                updated_csv = StringIO()
-                mapping_df.to_csv(updated_csv, index=False)
-                
-                st.download_button(
-                    label="Download Updated Mapping CSV",
-                    data=updated_csv.getvalue(),
-                    file_name="updated_mapping.csv",
-                    mime="text/csv",
-                    key="updated_mapping"
-                )
+                if st.button("Update Mapping File"):
+                    # Update the mapping
+                    updated_df, success = update_mapping_csv(st.session_state.files, mapping_df)
+                    
+                    if success:
+                        # Preview
+                        st.write("Preview of updated mapping:")
+                        st.dataframe(updated_df.head())
+                        
+                        # Convert to CSV
+                        csv = updated_df.to_csv(index=False)
+                        
+                        # Offer download
+                        st.download_button(
+                            label="Download Updated Mapping CSV",
+                            data=csv,
+                            file_name="updated_mapping.csv",
+                            mime="text/csv",
+                            key="updated_mapping"
+                        )
+                        
+                        # Show match statistics
+                        matched = updated_df['google_drive_url'].notna().sum()
+                        total = len(updated_df)
+                        st.info(f"Successfully matched {matched} out of {total} logos ({matched/total*100:.1f}%)")
+                    else:
+                        st.error(f"Error updating mapping: {success}")
                 
             except Exception as e:
                 st.error(f"Error processing mapping file: {str(e)}")
+        
+        # Option 3: Export full file list
+        st.subheader("Option 3: Export Complete File List")
+        
+        if st.button("Export Complete File List"):
+            # Create a complete DataFrame with all metadata
+            full_df = pd.DataFrame([
+                {
+                    'filename': f['name'], 
+                    'file_id': f['id'],
+                    'mime_type': f['mimeType'],
+                    'direct_url': f['direct_url']
+                }
+                for f in st.session_state.files
+            ])
+            
+            # Convert to CSV
+            csv = full_df.to_csv(index=False)
+            
+            # Offer download
+            st.download_button(
+                label="Download Complete File List CSV",
+                data=csv,
+                file_name="complete_file_list.csv",
+                mime="text/csv",
+                key="complete_list"
+            )
         
         # Instructions for Webflow
         st.header("Next Steps for Webflow CMS")
